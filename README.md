@@ -89,6 +89,15 @@ Two more problems from production:
 
 Fix `reconcile` and `reload`. Explain in `NOTES.md` what was wrong and what guarantees your version gives. `try_acquire` must not take an exclusive lock. Extra credit: a [`loom`](https://github.com/tokio-rs/loom) model or a deterministic interleaving test.
 
-## Submitting
+## Getting started and submitting
 
-Push your work to a **private** repository and invite the reviewers, or email us the output of `git format-patch origin/main`. Please don't fork this repo publicly or open pull requests against it.
+1. **Fork** this repository to your own GitHub account. The **Fork** button is at the top right of the repo page.
+2. Clone your fork and start your 90-minute clock:
+   ```sh
+   git clone https://github.com/<your-username>/exercise.git
+   cd exercise
+   ```
+3. Commit as you go. We read the commit history too, so small, clear commits help.
+4. When you're done, push to your fork and **send us the link to your fork**, e.g. `https://github.com/<your-username>/exercise`.
+
+Please don't open a pull request against this repo.
