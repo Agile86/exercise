@@ -6,69 +6,85 @@
 
 [QueryFlux](https://github.com/lakeops-org/queryflux) is a SQL gateway written in Rust. It sits in front of groups of engine clusters (Trino, StarRocks, DuckDB, ...) and routes each query to one of them. Before a query is forwarded, it must be **admitted** to a cluster. Each cluster accepts at most `max_running` concurrent queries.
 
-This crate is a simplified version of that admission controller. It works in a demo, but it is **not production ready**. Your job is to make it production ready.
+This crate is a simplified version of that admission controller. It is in production, and it is causing incidents. Your job is to make it production ready.
 
-`try_acquire` runs on every query, at thousands of queries per second, so it is on the hot path.
+`try_acquire` runs on every query, at thousands of queries per second, on 16-core gateway pods. It is on the hot path.
 
 ## Setup
 
 ```sh
-cargo test --no-fail-fast  # Parts 1 and 3
-cargo bench                # Part 2
-cargo test --test bonus -- --include-ignored   # Bonus
+cargo test     # the smoke tests in tests/smoke.rs, plus any tests you add
+cargo bench    # Part 2
 ```
 
-You need stable Rust. The bench uses `criterion` and writes reports to `target/criterion/`.
+You need stable Rust.
 
 ## Rules
 
-- Keep the public API that the tests and the bench use: type names, method names, and signatures. Everything else, including internals and private types, is yours to change.
-- Do not edit the tests. You may *add* tests.
+- Keep the public API: type names, method names, and signatures. Everything else is yours to change.
+- **We run a hidden test suite against your submission.** The behavior the hidden suite checks is described in this README and in the doc comments in `src/lib.rs`.
 - Prefer `std` and `tokio`. If you add a dependency, justify it in `NOTES.md`.
-- AI assistants are allowed. In the follow-up call you'll walk us through your changes and explain them, line by line.
+- AI assistants are allowed. In the follow-up call you'll walk us through your changes and explain every line, and we'll ask you to change something live.
 
-## Tasks
+## Part 1: Incidents (about 35 min)
 
-### Part 1: Correctness (about 25 min)
+These four incidents were reported against the current code. For each one:
 
-`cargo test --test part1_correctness` fails. Find and fix the bugs. For each one, write a sentence or two in `NOTES.md` saying what the bug was and how it shows up in production.
+1. Find the root cause.
+2. **Write a test that reproduces it** and fails on the original code. Put your tests in `tests/incidents.rs`.
+3. Fix it.
+4. Write a short root-cause analysis in `NOTES.md`.
 
-The tests also describe behavior the code must have. For example, a query that is aborted because the client disconnected must not hold its slot forever.
+> **INC-1: Cap exceeded, then wedged.** During a traffic spike, `trino-3` was seen running more queries than its `max_running`. The next morning the gateway rejected every query to the group as `Busy`, even though Trino was idle. A pod restart fixed it.
 
-### Part 2: Performance (about 30 min)
+> **INC-2: Capacity cut.** An operator lowered a cluster's `max_running` from 40 to 10 with `set_max_running` while it was busy. In staging, which runs a debug build, the gateway pod panicked. In production, the whole group kept returning `Busy` for a while, even though its other clusters were idle.
 
-Run `cargo bench` and save the numbers. Make `try_acquire` + `release` as cheap as you can, then record the before and after numbers in `NOTES.md`.
+> **INC-3: Busy with free capacity.** In a load test, clients got `Busy` errors while the dashboard showed free slots in the group.
 
-For each change, explain *why* it helps. A change you can't explain counts for less than one you can. If something doesn't scale with thread count, say what limits it.
+> **INC-4: Slots never recovered.** During a Trino outage, clients timed out and disconnected. After Trino came back, the group stayed at reduced capacity until the gateway was restarted.
 
-### Part 3: Queueing (about 20 min)
+Some incidents may share a root cause, and one incident may have more than one cause.
 
-Implement `acquire_timeout` and `queued`.
+## Part 2: Performance (about 30 min)
 
-When every cluster in the group is full, the caller waits up to `wait` for a slot instead of failing straight away. `queued(group)` reports how many callers are waiting right now, and it is exported as a gauge. The tests are in `tests/part3_queueing.rs`.
+Run `cargo bench` before you change anything and save the numbers.
 
-Watch out for lost wakeups, waiters that are cancelled, and timeouts.
+**Target: at least 3× the starter's throughput on `acquire_release/16`, on your machine, without breaking correctness.**
 
-### Part 4: Notes (about 10 min)
+Record the before and after numbers in `NOTES.md`, and explain *why* each change helps. If a change didn't help, say so. A change you can't explain counts for less than one you can.
 
-Fill in `NOTES.md`. Besides the parts above, answer this: **what would you still want before shipping this?**
+The behavior must stay "roughly least-loaded": queries spread across clusters in a group by how much capacity each has free. The exact policy is up to you. Justify it.
 
-### Bonus (optional, very hard)
+## Part 3: Waiting for a slot (about 15 min)
 
-Production counters drift. Engines kill queries, gateway pods crash, and releases get lost. Config also changes at runtime. Make these two methods correct:
+Implement `acquire_timeout` and `queued`. When every cluster in the group is full, the caller waits up to `wait` for a slot instead of failing straight away:
 
-- **`reconcile(group, cluster, fetch)`**: `fetch` asks the engine how many queries it is actually running.
-  - It is slow (50–500 ms), and its answer is already stale when it arrives.
-  - Correct the counter *without* losing admissions or releases that happen while `fetch` is in flight.
-  - Never exceed `max_running`.
-- **`reload(config)`**: swap in a new config while queries are in flight.
-  - Permits admitted under the old config must release correctly.
-  - Capacity must hold *across* the old and new configs: a reload must not let a cluster run 2× its limit.
-  - A removed cluster takes no new queries but drains the ones it has.
-  - Lowering `max_running` below the current count pauses admission until the count drains. It must not panic or underflow.
-  - `try_acquire` must not take an exclusive lock.
+- When a slot frees up, a waiter must be woken **promptly**, not on the next poll.
+- When the wait expires, the call returns `Timeout`.
+- A waiter whose future is dropped must leave the queue.
+- `queued(group)` reports how many callers are waiting right now.
 
-The tests are in `tests/bonus.rs`. A partial solution with good reasoning in `NOTES.md` is worth a lot. Extra credit: a [`loom`](https://github.com/tokio-rs/loom) model or a deterministic interleaving test that proves there are no lost updates.
+## Part 4: Design (about 10 min, written in `NOTES.md`)
+
+We are scaling to **6 gateway pods** behind a load balancer, all sharing the same clusters. Today each pod enforces `max_running` on its own, so a cluster with `max_running = 40` can receive 240 queries.
+
+How would you enforce the cap across all pods?
+
+- Give your design and what it costs on the hot path.
+- Say what happens when a pod dies holding slots, and when the network partitions.
+- Say what you would deliberately *not* build.
+
+Keep it to half a page.
+
+## Bonus (optional, very hard)
+
+Two more problems from production:
+
+> **INC-5:** The `reconcile` job, which corrects drift against the engine's own count, is supposed to fix INC-1-style drift. Under load it makes the counters *less* accurate.
+
+> **INC-6:** During config reloads, clusters briefly run above their caps, and the dashboards show running counts reset to zero.
+
+Fix `reconcile` and `reload`. Explain in `NOTES.md` what was wrong and what guarantees your version gives. `try_acquire` must not take an exclusive lock. Extra credit: a [`loom`](https://github.com/tokio-rs/loom) model or a deterministic interleaving test.
 
 ## Submitting
 

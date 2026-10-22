@@ -214,6 +214,9 @@ impl ClusterPool {
     }
 
     /// Bonus: swap in a new config while queries are in flight.
+    ///
+    /// A cluster keeps its identity across reloads by (group, name). Clusters removed
+    /// from the config take no new queries; clusters added to it take traffic at once.
     pub fn reload(&self, config: PoolConfig) {
         *self.groups.write().unwrap() = build_groups(&config);
     }

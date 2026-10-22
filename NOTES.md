@@ -1,10 +1,13 @@
 # Notes
 
-## Part 1: Bugs found
+## Part 1: Incidents
 
-| Bug | How it shows up in production | Fix |
-|-----|-------------------------------|-----|
-|     |                               |     |
+| Incident | Root cause | Reproducing test | Fix |
+|----------|------------|------------------|-----|
+| INC-1 | | | |
+| INC-2 | | | |
+| INC-3 | | | |
+| INC-4 | | | |
 
 ## Part 2: Performance
 
@@ -16,18 +19,18 @@ Machine (CPU and core count):
 | acquire_release/4  | | |
 | acquire_release/16 | | |
 
-Changes, and why each one helps:
+Changes, and why each one helps (or didn't):
 
 -
 
-What limits scaling at 16 threads:
+Selection policy, and why:
 
-## Part 3: Queueing design
+## Part 3: Waiting for a slot
 
-## Part 4: Before shipping, I would still want
+## Part 4: Global admission across 6 pods
+
+## Bonus: INC-5 and INC-6
+
+## Before shipping, I would still want
 
 -
-
-## Bonus
-
-## Anything else
