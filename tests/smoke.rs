@@ -1,5 +1,6 @@
 //! How the API is used. These pass on the starter code. Add your own tests next to
 //! this file; we also run a hidden test suite against your submission.
+//! The Part 3 tests are in `waiting.rs`.
 
 use std::sync::Arc;
 

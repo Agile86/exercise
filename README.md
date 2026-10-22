@@ -13,8 +13,8 @@ This crate is a simplified version of that admission controller. It is in produc
 ## Setup
 
 ```sh
-cargo test     # the smoke tests in tests/smoke.rs, plus any tests you add
-cargo bench    # Part 2
+cargo test --no-fail-fast   # smoke tests, Part 3 tests, and any tests you add
+cargo bench                 # Part 2
 ```
 
 You need stable Rust.
@@ -23,6 +23,7 @@ You need stable Rust.
 
 - Keep the public API: type names, method names, and signatures. Everything else is yours to change.
 - **We run a hidden test suite against your submission.** The behavior the hidden suite checks is described in this README and in the doc comments in `src/lib.rs`.
+- **Apart from Part 3, no test suite tells you you're done. Deciding that is part of the exercise.**
 - Prefer `std` and `tokio`. If you add a dependency, justify it in `NOTES.md`.
 - AI assistants are allowed. In the follow-up call you'll walk us through your changes and explain every line, and we'll ask you to change something live.
 
@@ -63,6 +64,8 @@ Implement `acquire_timeout` and `queued`. When every cluster in the group is ful
 - When the wait expires, the call returns `Timeout`.
 - A waiter whose future is dropped must leave the queue.
 - `queued(group)` reports how many callers are waiting right now.
+
+The tests in `tests/waiting.rs` check these. They fail until you implement Part 3.
 
 ## Part 4: Design (about 10 min, written in `NOTES.md`)
 
