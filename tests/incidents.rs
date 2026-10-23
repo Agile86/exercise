@@ -94,6 +94,27 @@ fn inc1_group_is_not_wedged_after_a_spike() {
     );
 }
 
+/// The counter can be moved under live permits by `reconcile` (the engine reports 0
+/// while one query is still in flight). Releasing that permit must not wrap the counter
+/// below zero: `u64::MAX` would make the cluster look full until a restart.
+#[tokio::test]
+async fn inc1_release_never_underflows_the_counter() {
+    let pool = pool(&[("a", 10)]);
+    let permit = pool.try_acquire("g").unwrap();
+
+    pool.reconcile("g", "a", || async { 0 }).await;
+    assert_eq!(pool.running("g", "a"), Some(0), "setup: reconcile applied");
+
+    permit.release();
+
+    assert_eq!(
+        pool.running("g", "a"),
+        Some(0),
+        "release with a zero counter must stay at zero"
+    );
+    assert!(pool.try_acquire("g").is_ok(), "idle cluster must admit a query");
+}
+
 // ---------------------------------------------------------------------------
 // INC-2: capacity cut below the current load.
 // ---------------------------------------------------------------------------
