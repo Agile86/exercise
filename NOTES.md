@@ -113,6 +113,54 @@ Selection policy, and why:
 
 ## Part 3: Waiting for a slot
 
+`acquire_timeout` first does a plain `try_acquire` (a free slot is returned at once, an unknown
+group fails at once). Only on `Busy` does it queue. `tests/waiting.rs` (6) and my
+`tests/waiting_extra.rs` (7) pass in debug and release; `waiting.rs` also passed 200/200 runs in
+each profile (16 worker threads).
+
+Design:
+
+- **Per group, `GroupShared { notify: tokio::sync::Notify, queued: AtomicU64 }`**, reachable from
+  every `ClusterState` of the group, so `Permit` still holds a single `Arc`. It survives `reload`
+  (kept by group name), so waiters never lose their queue.
+- **Wake-up:** `Permit::drop` decrements `running`, then wakes ONE waiter (`notify_one`). The woken
+  waiter runs the normal `try_acquire`, so a caller arriving at that moment can overtake it; it
+  then simply waits again. No polling: the waiter is parked on the `Notify` until a release.
+- **No lost wake-up, part 1 (the sleep gap).** The waiter registers (`Notified::enable`) *before*
+  its `try_acquire`. A slot freed between the failed attempt and the sleep therefore finds the
+  waiter already registered. (tokio also re-sends a `notify_one` that was assigned to a `Notified`
+  that is dropped before it ran, e.g. by a timeout or `abort`, to the next waiter; I checked this
+  in tokio 1.54.1 `drop_notified`.)
+- **No lost wake-up, part 2 (skipping `Notify` when nobody waits).** Calling `notify_one` on every
+  release would write to one shared word per group on the hot path and undo Part 2, so `drop`
+  first reads `queued` and only notifies when it is > 0. That gate is a store-buffer race: the
+  waiter does `queued += 1` then reads `running`; the releaser does `running -= 1` then reads
+  `queued`. Both could read the old value and the waiter would sleep with a free slot. Fix: the
+  releaser's decrement and its read of `queued` are `SeqCst`, the waiter puts a `SeqCst` fence
+  between `queued += 1` and its look for a slot, so at least one side sees the other (the
+  releaser wakes it, or the waiter finds the slot itself). On x86 the `SeqCst` RMW is the same
+  instruction as the relaxed one, so the hot path pays nothing; the fence is only on the slow path.
+- **Timeout:** `tokio::time::timeout` on the wait; when the deadline passes the waiter makes one
+  last `try_acquire` and only then returns `Timeout`. `wait = 0` is one attempt and `Timeout`.
+  `Duration::MAX` (deadline does not fit an `Instant`) waits without a deadline instead of
+  panicking. `acquire_timeout` never returns `Busy`.
+- **Leaving the queue:** `queued` is held by a `QueueGuard` (RAII), so it goes back down on
+  success, timeout and when the future is dropped or its task aborted. `queued(group)` is that
+  counter, so it is exact at the moment a waiter leaves.
+- **Other ways a slot appears:** `set_max_running`, `reload` and `reconcile` wake *all* waiters of
+  the affected groups (`notify_waiters`), since they may free any number of slots. A group removed
+  by `reload` wakes its waiters too, and they return `UnknownGroup` immediately.
+
+Checks beyond the given tests: mutation runs (a `slot_freed` that never wakes fails 2 of the 6
+given tests; a `capacity_changed` that never wakes fails exactly the 3 matching tests in
+`waiting_extra.rs`), and `a_waiter_that_gives_up_does_not_swallow_the_wakeup` (100 rounds of a
+short-timeout waiter and a long one racing for the same slot). Cost on the hot path: bench
+/1 26.6, /4 32.0, /16 42.9 Melem/s after Part 3 vs 26.5, 33.1, 44.7 before (inside run noise).
+
+Not done: strict FIFO fairness (a barging `try_acquire` can take a slot ahead of a waiter; I
+would add a ticket queue if starvation showed up in production), a cap on the queue length, and
+per-waiter priorities.
+
 ## Part 4: Global admission across 6 pods
 
 ## Bonus: INC-5 and INC-6

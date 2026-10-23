@@ -11,9 +11,12 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
+
+use tokio::sync::Notify;
+use tokio::time::{timeout, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterConfig {
@@ -59,15 +62,18 @@ struct ClusterState {
     running: AtomicU64,
     /// Total queries ever admitted (a metric scraped by Prometheus).
     admissions: AtomicU64,
+    /// Where callers waiting for a slot of this cluster's group are woken.
+    group: Arc<GroupShared>,
 }
 
 impl ClusterState {
-    fn new(config: &ClusterConfig) -> Self {
+    fn new(config: &ClusterConfig, group: Arc<GroupShared>) -> Self {
         Self {
             name: config.name.clone(),
             max_running: AtomicU64::new(config.max_running),
             running: AtomicU64::new(0),
             admissions: AtomicU64::new(0),
+            group,
         }
     }
 
@@ -96,16 +102,80 @@ impl ClusterState {
 
     /// Give one slot back. Never goes below zero: a counter that wrapped to `u64::MAX`
     /// would make the cluster look full until the process restarts.
+    ///
+    /// `SeqCst`, not `Relaxed`: together with the `SeqCst` read of `queued` that follows
+    /// it in `GroupShared::slot_freed`, this is the releasing half of the handshake that
+    /// keeps a waiter from sleeping through a free slot (see `QueueGuard::enter`).
+    /// On x86 a read-modify-write is a full barrier anyway, so this costs nothing there.
     fn decrement(&self) {
         let _ = self
             .running
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             });
     }
 }
 
-type Groups = HashMap<String, Vec<Arc<ClusterState>>>;
+/// What the callers of one group share: the wait queue for `acquire_timeout`.
+/// Aligned so `queued`, which every release reads, does not share a cache line with the
+/// counters that every query writes.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct GroupShared {
+    notify: Notify,
+    /// Callers currently inside `acquire_timeout` waiting for this group.
+    queued: AtomicU64,
+}
+
+impl GroupShared {
+    /// A query finished and gave its slot back: wake one waiter, if there is one. The
+    /// check keeps `Notify` (a shared, written word) off the path of every release when
+    /// nobody waits.
+    fn slot_freed(&self) {
+        if self.queued.load(Ordering::SeqCst) > 0 {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Capacity changed by an unknown amount (`set_max_running`, `reload`): every waiter
+    /// looks again.
+    fn capacity_changed(&self) {
+        if self.queued.load(Ordering::SeqCst) > 0 {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+/// Counts a caller as queued for as long as it lives, whichever way its future ends:
+/// slot obtained, timeout, or dropped by the caller.
+struct QueueGuard<'a>(&'a GroupShared);
+
+impl<'a> QueueGuard<'a> {
+    fn enter(shared: &'a GroupShared) -> Self {
+        shared.queued.fetch_add(1, Ordering::SeqCst);
+        // The waiter announces itself (`queued`) and then looks for a free slot; a
+        // releaser frees the slot (`running`) and then looks for waiters. With a
+        // `SeqCst` fence here and `SeqCst` on the releaser's side, at least one of them
+        // sees the other: either the releaser sees `queued > 0` and wakes us, or we see
+        // the freed slot. Without it both can miss each other and the waiter sleeps
+        // until its timeout although a slot is free.
+        fence(Ordering::SeqCst);
+        Self(shared)
+    }
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct Group {
+    shared: Arc<GroupShared>,
+    clusters: Vec<Arc<ClusterState>>,
+}
+
+type Groups = HashMap<String, Group>;
 
 /// Groups with at most this many clusters always pick the exact least-loaded one.
 const EXACT_SCAN_MAX: usize = 4;
@@ -178,6 +248,7 @@ impl ClusterPool {
     fn find(&self, group: &str, cluster: &str) -> Option<Arc<ClusterState>> {
         self.read()
             .get(group)?
+            .clusters
             .iter()
             .find(|c| c.name == cluster)
             .cloned()
@@ -188,7 +259,10 @@ impl ClusterPool {
         // Borrow the cluster list under the read guard: no clone of the Vec, no Arc
         // traffic for clusters we do not pick.
         let groups = self.read();
-        let clusters = groups.get(group).ok_or(AcquireError::UnknownGroup)?;
+        let clusters = &groups
+            .get(group)
+            .ok_or(AcquireError::UnknownGroup)?
+            .clusters;
 
         let n = clusters.len();
         if n == 0 {
@@ -255,14 +329,52 @@ impl ClusterPool {
         }
     }
 
-    /// Part 3: like `try_acquire`, but wait up to `wait` for a slot to free up.
+    /// Like `try_acquire`, but when every cluster is full wait up to `wait` for a slot.
+    ///
+    /// A waiter is woken by the release that frees a slot (no polling) and then tries
+    /// like any other caller, so a caller arriving at that moment can overtake it; the
+    /// waiter simply goes back to waiting. Returns `Timeout` once `wait` has passed, after
+    /// one last attempt. Dropping the future takes the caller out of the queue.
     pub async fn acquire_timeout(
         self: &Arc<Self>,
         group: &str,
         wait: Duration,
     ) -> Result<Permit, AcquireError> {
-        let _ = (group, wait);
-        todo!("Part 3")
+        match self.try_acquire(group) {
+            Err(AcquireError::Busy) => {}
+            done => return done,
+        }
+        let shared = match self.read().get(group) {
+            Some(g) => Arc::clone(&g.shared),
+            None => return Err(AcquireError::UnknownGroup),
+        };
+        // `None`: the deadline does not fit in an `Instant`, wait without one.
+        let deadline = Instant::now().checked_add(wait);
+
+        let _queued = QueueGuard::enter(&shared);
+        loop {
+            // Register for wake-ups *before* looking for a slot, so a slot freed between
+            // the look and the sleep is not missed.
+            let notified = shared.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            match self.try_acquire(group) {
+                Err(AcquireError::Busy) => {}
+                done => return done,
+            }
+
+            match deadline {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(AcquireError::Timeout);
+                    }
+                    let _ = timeout(left, notified).await;
+                }
+                None => notified.await,
+            }
+        }
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -272,8 +384,9 @@ impl ClusterPool {
 
     /// Number of callers currently waiting inside `acquire_timeout` for `group`.
     pub fn queued(&self, group: &str) -> u64 {
-        let _ = group;
-        todo!("Part 3")
+        self.read()
+            .get(group)
+            .map_or(0, |g| g.shared.queued.load(Ordering::SeqCst))
     }
 
     /// Total queries ever admitted to a cluster (a metric scraped by Prometheus).
@@ -285,7 +398,8 @@ impl ClusterPool {
     /// Admin API: change a cluster's capacity at runtime.
     pub fn set_max_running(&self, group: &str, cluster: &str, max_running: u64) {
         if let Some(state) = self.find(group, cluster) {
-            state.max_running.store(max_running, Ordering::Relaxed);
+            state.max_running.store(max_running, Ordering::SeqCst);
+            state.group.capacity_changed();
         }
     }
 
@@ -296,9 +410,17 @@ impl ClusterPool {
     pub fn reload(&self, config: PoolConfig) {
         // Lock every shard (always in index order) so readers never see two tables.
         let mut guards: Vec<_> = self.shards.iter().map(|s| s.0.write().unwrap()).collect();
-        let new = Arc::new(build_groups(&config, &guards[0]));
+        let old = Arc::clone(&guards[0]);
+        let new = Arc::new(build_groups(&config, &old));
         for guard in &mut guards {
             **guard = Arc::clone(&new);
+        }
+        drop(guards);
+
+        // Capacity may have grown, and a group may be gone: waiters look again (and
+        // get `UnknownGroup` for a group that no longer exists).
+        for group in old.values().chain(new.values()) {
+            group.shared.capacity_changed();
         }
     }
 
@@ -311,38 +433,37 @@ impl ClusterPool {
     {
         let target = fetch().await;
         if let Some(state) = self.find(group, cluster) {
-            state.running.store(target, Ordering::Relaxed);
+            state.running.store(target, Ordering::SeqCst);
+            state.group.capacity_changed();
         }
     }
 }
 
-/// Build the group table for `config`. A cluster that already exists in `old` under the
-/// same (group, name) is kept as it is, so its running and admissions counters survive;
-/// only its `max_running` is updated.
-fn build_groups(
-    config: &PoolConfig,
-    old: &HashMap<String, Vec<Arc<ClusterState>>>,
-) -> HashMap<String, Vec<Arc<ClusterState>>> {
+/// Build the group table for `config`. A group or cluster that already exists in `old`
+/// under the same name is kept as it is, so its counters and its waiters survive; only
+/// the `max_running` of a cluster is updated.
+fn build_groups(config: &PoolConfig, old: &Groups) -> Groups {
     config
         .groups
         .iter()
-        .map(|(group, clusters)| {
-            let states = clusters
+        .map(|(name, clusters)| {
+            let old_group = old.get(name);
+            let shared = old_group.map_or_else(Default::default, |g| Arc::clone(&g.shared));
+            let clusters = clusters
                 .iter()
                 .map(|c| {
-                    let existing = old
-                        .get(group)
-                        .and_then(|v| v.iter().find(|s| s.name == c.name));
+                    let existing =
+                        old_group.and_then(|g| g.clusters.iter().find(|s| s.name == c.name));
                     match existing {
                         Some(state) => {
-                            state.max_running.store(c.max_running, Ordering::Relaxed);
+                            state.max_running.store(c.max_running, Ordering::SeqCst);
                             Arc::clone(state)
                         }
-                        None => Arc::new(ClusterState::new(c)),
+                        None => Arc::new(ClusterState::new(c, Arc::clone(&shared))),
                     }
                 })
                 .collect();
-            (group.clone(), states)
+            (name.clone(), Group { shared, clusters })
         })
         .collect()
 }
@@ -373,5 +494,6 @@ impl Permit {
 impl Drop for Permit {
     fn drop(&mut self) {
         self.state.decrement();
+        self.state.group.slot_freed();
     }
 }
