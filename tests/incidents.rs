@@ -16,6 +16,15 @@ fn pool(clusters: &[(&str, u64)]) -> Arc<ClusterPool> {
     ))
 }
 
+/// Running counts of `clusters`, for failure messages: `a=Some(40), b=Some(0)`.
+fn state(pool: &ClusterPool, clusters: &[&str]) -> String {
+    clusters
+        .iter()
+        .map(|c| format!("{c}={:?}", pool.running("g", c)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `threads` threads start together and each calls `try_acquire` `attempts` times,
 /// keeping every permit it gets. Returns all permits that were handed out.
 fn stampede(pool: &Arc<ClusterPool>, threads: usize, attempts: usize) -> Vec<Permit> {
@@ -80,5 +89,77 @@ fn inc1_group_is_not_wedged_after_a_spike() {
     assert!(
         pool.try_acquire("g").is_ok(),
         "idle cluster must admit a new query"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// INC-2: capacity cut below the current load.
+// ---------------------------------------------------------------------------
+
+/// `a` is full (40 running), then an operator cuts it to 10. `a` is now over its
+/// cap, but `b` is idle: new queries must go to `b`. (Starter: `max - running`
+/// underflows; debug builds panic, release builds see `a` as hugely free, pick it,
+/// fail to increment and answer `Busy` for the whole group.)
+#[test]
+fn inc2_cut_below_running_sends_traffic_to_other_clusters() {
+    let pool = pool(&[("a", 40), ("b", 40)]);
+
+    // Fill `a` only: take `b` out of rotation while we do it.
+    pool.set_max_running("g", "b", 0);
+    let _held: Vec<_> = (0..40).map(|_| pool.try_acquire("g").unwrap()).collect();
+    pool.set_max_running("g", "b", 40);
+    assert_eq!(pool.running("g", "a"), Some(40), "setup: {}", state(&pool, &["a", "b"]));
+
+    pool.set_max_running("g", "a", 10);
+
+    for i in 0..5 {
+        let permit = pool.try_acquire("g").unwrap_or_else(|e| {
+            panic!(
+                "query {i}: {e:?} although `b` is idle (cap 40) [{}]",
+                state(&pool, &["a", "b"])
+            )
+        });
+        assert_eq!(
+            permit.cluster(),
+            "b",
+            "query {i} was admitted to the over-cap cluster [{}]",
+            state(&pool, &["a", "b"])
+        );
+    }
+    assert_eq!(
+        pool.running("g", "a"),
+        Some(40),
+        "`a` must take nothing new while it is over its cap"
+    );
+}
+
+/// A cluster over its new cap admits nothing until it has drained *below* the cap,
+/// and never panics while it is over it.
+#[test]
+fn inc2_over_cap_cluster_admits_again_only_after_draining_below_new_cap() {
+    let pool = pool(&[("a", 40)]);
+    let mut held: Vec<_> = (0..40).map(|_| pool.try_acquire("g").unwrap()).collect();
+
+    pool.set_max_running("g", "a", 10);
+    assert_eq!(
+        pool.try_acquire("g").err(),
+        Some(admission::AcquireError::Busy),
+        "40 running, cap 10 [{}]",
+        state(&pool, &["a"])
+    );
+
+    held.drain(..30).for_each(|p| p.release());
+    assert_eq!(
+        pool.try_acquire("g").err(),
+        Some(admission::AcquireError::Busy),
+        "running == cap (10 of 10) is still full [{}]",
+        state(&pool, &["a"])
+    );
+
+    held.drain(..1).for_each(|p| p.release());
+    assert!(
+        pool.try_acquire("g").is_ok(),
+        "9 running, cap 10: one slot is free [{}]",
+        state(&pool, &["a"])
     );
 }

@@ -75,8 +75,9 @@ impl ClusterState {
         self.max_running.load(Ordering::Relaxed)
     }
 
+    /// Free slots. Zero, not an underflow, when the cap was lowered below the load.
     fn available(&self) -> u64 {
-        self.max_running() - self.running()
+        self.max_running().saturating_sub(self.running())
     }
 
     /// Take one slot if the cluster is below its cap. The check and the increment are
