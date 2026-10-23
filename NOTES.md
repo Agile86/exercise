@@ -163,6 +163,35 @@ per-waiter priorities.
 
 ## Part 4: Global admission across 6 pods
 
+**Design: lease the cap out, do not count globally.** A small coordinator on a store the platform
+already runs (Redis/Lua, etcd or Postgres) keeps, per cluster, `max_running` and the leases
+`pod -> (slots, expires_at)`, with `sum(live leases) <= max_running`. A pod's lease *is* its local
+`max_running`, so `try_acquire` stays one local CAS. A background task renews every ~1 s, reports usage,
+asks for more above ~80% use and gives slack back when idle; the grant is one atomic update
+(`min(want, max - sum(live leases))`). Applying it is a `set_max_running`, which already behaves
+right: a cut below the load admits nothing until it drains (INC-2), a raise wakes waiters (Part 3).
+Unlike a fixed `cap / 6`, idle pods hold nothing, so an uneven load balancer strands no capacity.
+
+**Hot-path cost: none** (no network, no new shared state). The costs are ~1 coordinator call per pod
+per cluster per second, and delayed rebalancing: a pod with its lease used up waits up to one renewal
+(an early one is triggered by `Busy`). The cap is hard; 100% utilisation is not instant. Waiters stay
+pod-local.
+
+**Pod dies holding slots:** its lease expires after the TTL (~10 s) and is granted again. Its queries
+may still run on the engine, so the cluster can exceed its cap by up to that lease for a while. I accept
+that bounded overshoot and shrink it by never granting more than `max - engine's own running count`
+(`reconcile`).
+
+**Network partition:** a cut-off pod stops using its lease slightly *before* the coordinator expires it
+(monotonic local timer, margin for skew), then admits nothing new on that cluster while running queries
+finish. It fails closed, so a partition costs availability, never the cap. A small permanent floor
+(`cap / (2 * pods)`) outside the lease would make that degrade instead of stop.
+
+**Deliberately not built:** a global counter updated per query (a ~1 ms round trip and a single point
+of failure on every query), locks or consensus per admission, exact cross-pod "least loaded"
+selection, a cross-pod fair queue, or our own consensus: the coordinator is a plain store with one
+atomic update.
+
 ## Bonus: INC-5 and INC-6
 
 ## Before shipping, I would still want
