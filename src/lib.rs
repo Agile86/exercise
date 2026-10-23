@@ -79,17 +79,24 @@ impl ClusterState {
         self.max_running() - self.running()
     }
 
+    /// Take one slot if the cluster is below its cap. The check and the increment are
+    /// a single compare-and-swap, so concurrent callers cannot both take the last slot.
     fn try_increment(&self) -> bool {
-        let current = self.running.load(Ordering::Relaxed);
-        if current >= self.max_running() {
-            return false;
-        }
-        self.running.store(current + 1, Ordering::Relaxed);
-        true
+        self.running
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < self.max_running()).then(|| current + 1)
+            })
+            .is_ok()
     }
 
+    /// Give one slot back. Never goes below zero: a counter that wrapped to `u64::MAX`
+    /// would make the cluster look full until the process restarts.
     fn decrement(&self) {
-        self.running.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .running
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            });
     }
 }
 

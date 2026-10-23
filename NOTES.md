@@ -4,7 +4,7 @@
 
 | Incident | Root cause | Reproducing test | Fix |
 |----------|------------|------------------|-----|
-| INC-1 | | | |
+| INC-1 | `try_increment` was `load`, compare, `store(current + 1)`: not atomic. Two threads read the same `running`, both pass the cap check, both store the same value, so one increment is lost. More permits than `max_running` are handed out and `running` is lower than the real number of holders. When those holders release, `decrement` (`fetch_sub`, unguarded) takes the counter below 0, it wraps to ~`u64::MAX`, the cluster looks permanently full and every query gets `Busy`, until a restart resets the counter. | `inc1_cap_is_never_exceeded_under_contention` (16 threads race for 1000 slots: starter hands out 1021) and `inc1_group_is_not_wedged_after_a_spike` (after releasing everything, starter has `running = 2^64 - 19`). Both fail 11/11 runs on the starter. | Check and increment are one CAS loop (`fetch_update`). `decrement` is also a CAS that stops at 0 (`checked_sub`), so an accounting error elsewhere (`reconcile`, `reload`) can no longer wedge the cluster. |
 | INC-2 | | | |
 | INC-3 | | | |
 | INC-4 | | | |
