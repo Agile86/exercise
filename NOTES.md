@@ -194,6 +194,75 @@ atomic update.
 
 ## Bonus: INC-5 and INC-6
 
+**Status: not finished (out of time). `reconcile` is still the starter code, do not run it in
+production as it is.** `reload` is mostly fixed as a side effect of Part 2. I wrote 13 tests with
+deterministic interleavings (a `fetch` that waits on a oneshot gate, so the test decides what
+the pool does while the engine is being asked). Run against the starter commit 9 of them fail; against
+the current code 5 fail: the four `reconcile` ones and "cluster removed and added back". The file is
+not in the repo because it is red; the cases are listed below.
+
+**INC-6 (`reload`), what is already done.** The starter built a fresh `ClusterState` (running = 0)
+for every cluster on every reload, so queries in flight stopped counting against the cap (a cluster
+could run above it) and the dashboards saw the counters drop to 0. Since Part 2, `reload` keeps existing
+states by (group, name) and only updates `max_running`, `Permit` holds the `Arc` of the state it took
+its slot from (so a release always goes back to the right counter, also after a reload), and
+`admissions` lives in that state. `try_acquire` takes only a read lock on its own shard.
+
+**INC-6, what is left.**
+1. A cluster removed from the config while queries still run on it and added back later gets a new
+   state with running = 0, so the old queries stop counting. Fix: keep `Weak<ClusterState>` (and
+   `Weak<GroupShared>`) of removed clusters/groups in a registry and revive them on re-add. A state
+   stays alive exactly as long as a permit holds it, so "alive" and "has live queries" coincide.
+2. `reload` builds the new table while holding all 32 write locks, so admission waits for the
+   build. Fix: serialize reloads with a mutex, build the table from the current one outside the
+   locks, and take the write locks only to swap the pointer.
+
+**INC-5 (`reconcile`), what is wrong.** `store(fetch().await)` writes an answer that is stale by the
+time it arrives. Everything admitted or released during the (slow) fetch is wiped out, and since later
+`+1`/`-1` are relative to a wrong base, the error stays: this is why it makes the counters less
+accurate under load. Also `find` runs after the fetch, so after a reload it can hit a different
+object than the one the permits point to.
+
+**INC-5, the fix I would make and the guarantee it gives.** The engine counted at an unknown instant
+t* inside the fetch window, so comparing its answer with the counter at the start of the window
+invents drift that is not there (a truthful engine would get "corrected" into error). What is
+knowable is a bound on the counter during the window. Pack `running` (40 bits) and a change
+sequence (24 bits) into the one `AtomicU64` that the hot path already CASes; every acquire and release
+bumps the sequence in the same CAS, so it costs nothing extra and a snapshot `(running, seq)` is
+atomic. `reconcile` takes the cluster (`Arc`) and a snapshot `(s0, seq0)` *before* calling `fetch`
+(serialized per cluster by an async mutex, so no other correction moves the counter in the window),
+and after it a second snapshot. With `d = seq1 - seq0` events, the counter at t* was in
+`[max(0, s0 - d), s0 + d]` (if `d` could have wrapped, skip this round). Apply the engine's answer
+`v` only beyond that range: `v < lo` gives `v - lo`, `v > hi` gives `v - hi`, otherwise 0, as a
+*relative* update (`fetch_update` on the word) so concurrent acquires and releases are kept, then wake
+waiters. Guarantee: the correction has the sign of the true drift and never exceeds it for any t* in the
+window, so a round never increases the error; a truthful engine changes nothing, however much churn
+there is; a quiet cluster (d = 0) is corrected exactly; under heavy churn it only corrects drift larger
+than the churn in one fetch, which is the most one can claim without knowing t*. Not covered: drift
+smaller than that range, and an engine that is itself wrong.
+
+Tests I wrote for it (all deterministic except the churn ones): queries admitted during the fetch are
+kept; releases during the fetch are kept; a truthful engine under 4 churn threads and 300 reconciles
+leaves exactly 0; real drift is corrected when quiet (both signs); only what churn cannot explain is
+corrected (2 live, +3 -1 in the window: 4 is accepted; 4 live, +3 -1: 9 is corrected by 1); a pending
+reconcile does not block `try_acquire`; a reload during the fetch does not corrupt other counters; for
+`reload`: counters survive, a full cluster stays full, a permit released after a reload returns its own
+slot, a removed-and-added-back cluster keeps its queries, and the cap holds under 2000 reloads against
+8 threads. Not done: a `loom` model (would need the atomics behind a `cfg(loom)` switch).
+
 ## Before shipping, I would still want
 
--
+- The Bonus fix above, with its tests, before the reconcile job is switched on anywhere.
+- All the atomics tested on ARM too: the `SeqCst` handshake between `Permit::drop` and the waiter
+  (Part 3) was only run on x86, where the hardware is stronger than the Rust memory model. A `loom`
+  model of that handshake and of the sequence-number scheme would be the real proof.
+- The benchmark on the real 16-core pods and with a realistic mix (several groups, bursts), not on
+  a laptop whose `/16` number moved by 70% between two runs of the same code.
+- A soak test against a real or simulated engine with clients that disconnect mid-query (INC-4) and
+  engine outages, watching `running` against the engine's own count for drift.
+- Metrics and alerts: `queued`, wait time and `Timeout`/`Busy` rates per group, `running` vs engine
+  count, number of reloads. Without them the next incident is found by users again.
+- A decision on waiter fairness and a cap on queue length: a barging `try_acquire` can overtake a
+  waiter, and nothing bounds how many callers wait.
+- A prototype of the Part 4 coordinator with failure drills (kill a pod, partition it, kill the
+  coordinator) before relying on the design.
