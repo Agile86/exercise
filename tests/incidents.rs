@@ -7,13 +7,15 @@ use std::thread;
 use admission::{AcquireError, ClusterConfig, ClusterPool, Permit, PoolConfig};
 
 fn pool(clusters: &[(&str, u64)]) -> Arc<ClusterPool> {
-    ClusterPool::new(PoolConfig::default().group(
-        "g",
-        clusters
-            .iter()
-            .map(|(name, max)| ClusterConfig::new(*name, *max))
-            .collect(),
-    ))
+    ClusterPool::new(
+        PoolConfig::default().group(
+            "g",
+            clusters
+                .iter()
+                .map(|(name, max)| ClusterConfig::new(*name, *max))
+                .collect(),
+        ),
+    )
 }
 
 /// Running counts of `clusters`, for failure messages: `a=Some(40), b=Some(0)`.
@@ -108,7 +110,12 @@ fn inc2_cut_below_running_sends_traffic_to_other_clusters() {
     pool.set_max_running("g", "b", 0);
     let _held: Vec<_> = (0..40).map(|_| pool.try_acquire("g").unwrap()).collect();
     pool.set_max_running("g", "b", 40);
-    assert_eq!(pool.running("g", "a"), Some(40), "setup: {}", state(&pool, &["a", "b"]));
+    assert_eq!(
+        pool.running("g", "a"),
+        Some(40),
+        "setup: {}",
+        state(&pool, &["a", "b"])
+    );
 
     pool.set_max_running("g", "a", 10);
 
@@ -218,8 +225,15 @@ fn inc4_dropped_permit_gives_its_slot_back() {
 
     drop(permit);
 
-    assert_eq!(pool.running("g", "a"), Some(0), "slot leaked by a dropped permit");
-    assert!(pool.try_acquire("g").is_ok(), "the only slot must be usable again");
+    assert_eq!(
+        pool.running("g", "a"),
+        Some(0),
+        "slot leaked by a dropped permit"
+    );
+    assert!(
+        pool.try_acquire("g").is_ok(),
+        "the only slot must be usable again"
+    );
 }
 
 /// The real incident: clients time out and disconnect, so the tasks serving them are
@@ -275,8 +289,15 @@ fn inc4_panicking_handler_gives_its_slot_back() {
     })
     .join();
 
-    assert!(result.is_err(), "setup: the handler thread should have panicked");
-    assert_eq!(pool.running("g", "a"), Some(0), "slot leaked by a panicking handler");
+    assert!(
+        result.is_err(),
+        "setup: the handler thread should have panicked"
+    );
+    assert_eq!(
+        pool.running("g", "a"),
+        Some(0),
+        "slot leaked by a panicking handler"
+    );
 }
 
 /// Guard for the fix: `release()` followed by the permit being dropped must count
