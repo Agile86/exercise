@@ -261,8 +261,13 @@ impl Permit {
         &self.cluster
     }
 
-    /// Give the slot back once the query has finished.
-    pub fn release(self) {
+    /// Give the slot back once the query has finished. Dropping the permit does the
+    /// same, so a cancelled or panicking request cannot leak its slot.
+    pub fn release(self) {}
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
         self.pool.release(&self.group, &self.cluster);
     }
 }

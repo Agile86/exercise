@@ -204,3 +204,95 @@ fn inc3_no_busy_while_the_group_has_free_slots() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// INC-4: slots never recovered after clients disconnected.
+// ---------------------------------------------------------------------------
+
+/// A permit that is dropped without an explicit `release()` must give its slot back.
+#[test]
+fn inc4_dropped_permit_gives_its_slot_back() {
+    let pool = pool(&[("a", 1)]);
+    let permit = pool.try_acquire("g").unwrap();
+    assert_eq!(pool.running("g", "a"), Some(1));
+
+    drop(permit);
+
+    assert_eq!(pool.running("g", "a"), Some(0), "slot leaked by a dropped permit");
+    assert!(pool.try_acquire("g").is_ok(), "the only slot must be usable again");
+}
+
+/// The real incident: clients time out and disconnect, so the tasks serving them are
+/// cancelled while they hold a permit. Cancelling drops the future and its permit.
+#[tokio::test]
+async fn inc4_cancelled_request_gives_its_slot_back() {
+    let pool = pool(&[("a", 2)]);
+
+    let handlers: Vec<_> = (0..2)
+        .map(|_| {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move {
+                let _permit = pool.try_acquire("g").unwrap();
+                std::future::pending::<()>().await; // waiting for a Trino that never answers
+            })
+        })
+        .collect();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while pool.running("g", "a") != Some(2) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "setup: handlers never took their slots [{}]",
+            state(&pool, &["a"])
+        );
+        tokio::task::yield_now().await;
+    }
+
+    // Clients disconnect.
+    handlers.iter().for_each(|h| h.abort());
+    for h in handlers {
+        let _ = h.await;
+    }
+
+    assert_eq!(
+        pool.running("g", "a"),
+        Some(0),
+        "2 cancelled requests leaked their slots [{}]",
+        state(&pool, &["a"])
+    );
+    assert!(pool.try_acquire("g").is_ok());
+}
+
+/// A handler that panics while holding a permit must not leak the slot either.
+#[test]
+fn inc4_panicking_handler_gives_its_slot_back() {
+    let pool = pool(&[("a", 1)]);
+    let for_thread = Arc::clone(&pool);
+
+    let result = thread::spawn(move || {
+        let _permit = for_thread.try_acquire("g").unwrap();
+        panic!("query handler crashed");
+    })
+    .join();
+
+    assert!(result.is_err(), "setup: the handler thread should have panicked");
+    assert_eq!(pool.running("g", "a"), Some(0), "slot leaked by a panicking handler");
+}
+
+/// Guard for the fix: `release()` followed by the permit being dropped must count
+/// once, not twice. (Passes on the starter; fails if `Drop` is added naively.)
+#[test]
+fn inc4_explicit_release_is_not_counted_twice() {
+    let pool = pool(&[("a", 2)]);
+    let first = pool.try_acquire("g").unwrap();
+    let _second = pool.try_acquire("g").unwrap();
+
+    first.release();
+
+    assert_eq!(
+        pool.running("g", "a"),
+        Some(1),
+        "one permit is still held [{}]",
+        state(&pool, &["a"])
+    );
+}
