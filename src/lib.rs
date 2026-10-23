@@ -107,15 +107,6 @@ struct Candidate {
     available: u64,
 }
 
-/// Least-loaded selection: the candidate with the most free slots wins.
-fn pick(candidates: &[Candidate]) -> Option<usize> {
-    candidates
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, c)| c.available)
-        .map(|(i, _)| i)
-}
-
 pub struct ClusterPool {
     groups: RwLock<HashMap<String, Vec<Arc<ClusterState>>>>,
     admissions: Mutex<HashMap<String, u64>>,
@@ -143,7 +134,7 @@ impl ClusterPool {
     pub fn try_acquire(self: &Arc<Self>, group: &str) -> Result<Permit, AcquireError> {
         let clusters = self.clusters(group).ok_or(AcquireError::UnknownGroup)?;
 
-        let candidates: Vec<Candidate> = clusters
+        let mut candidates: Vec<Candidate> = clusters
             .iter()
             .map(|c| Candidate {
                 name: c.name.clone(),
@@ -152,29 +143,33 @@ impl ClusterPool {
             .filter(|c| c.available > 0)
             .collect();
 
-        let chosen = pick(&candidates).ok_or(AcquireError::Busy)?;
-        let name = candidates[chosen].name.clone();
-        let state = clusters
-            .iter()
-            .find(|c| c.name == name)
-            .ok_or(AcquireError::Busy)?;
+        // Least-loaded first. The snapshot is already stale, so another caller may take
+        // the last slot of the best cluster before we do; `Busy` is only right once
+        // every candidate has refused.
+        candidates.sort_by(|a, b| b.available.cmp(&a.available));
 
-        if !state.try_increment() {
-            return Err(AcquireError::Busy);
+        for candidate in candidates {
+            let Some(state) = clusters.iter().find(|c| c.name == candidate.name) else {
+                continue;
+            };
+            if !state.try_increment() {
+                continue;
+            }
+
+            *self
+                .admissions
+                .lock()
+                .unwrap()
+                .entry(format!("{group}/{}", candidate.name))
+                .or_insert(0) += 1;
+
+            return Ok(Permit {
+                pool: Arc::clone(self),
+                group: group.to_string(),
+                cluster: candidate.name,
+            });
         }
-
-        *self
-            .admissions
-            .lock()
-            .unwrap()
-            .entry(format!("{group}/{name}"))
-            .or_insert(0) += 1;
-
-        Ok(Permit {
-            pool: Arc::clone(self),
-            group: group.to_string(),
-            cluster: name,
-        })
+        Err(AcquireError::Busy)
     }
 
     /// Part 3: like `try_acquire`, but wait up to `wait` for a slot to free up.

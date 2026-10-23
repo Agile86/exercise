@@ -4,7 +4,7 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use admission::{ClusterConfig, ClusterPool, Permit, PoolConfig};
+use admission::{AcquireError, ClusterConfig, ClusterPool, Permit, PoolConfig};
 
 fn pool(clusters: &[(&str, u64)]) -> Arc<ClusterPool> {
     ClusterPool::new(PoolConfig::default().group(
@@ -162,4 +162,45 @@ fn inc2_over_cap_cluster_admits_again_only_after_draining_below_new_cap() {
         "9 running, cap 10: one slot is free [{}]",
         state(&pool, &["a"])
     );
+}
+
+// ---------------------------------------------------------------------------
+// INC-3: Busy while the group still has free slots.
+// ---------------------------------------------------------------------------
+
+/// `threads` threads start together and each makes exactly one `try_acquire`.
+fn one_shot(pool: &Arc<ClusterPool>, threads: usize) -> Vec<Result<Permit, AcquireError>> {
+    let barrier = Barrier::new(threads);
+    thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    barrier.wait();
+                    pool.try_acquire("g")
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    })
+}
+
+/// 16 callers, 16 slots in total (`a`: 8, `b`: 8), nobody releases. While a caller is
+/// still trying, at most 15 slots are taken, so the group is never full and no caller
+/// may see `Busy`. (Starter: every caller picks one cluster from a stale snapshot; if
+/// that cluster fills up meanwhile it answers `Busy` without trying the other one.)
+#[test]
+fn inc3_no_busy_while_the_group_has_free_slots() {
+    for round in 0..3_000 {
+        let pool = pool(&[("a", 8), ("b", 8)]);
+        let results = one_shot(&pool, 16);
+
+        let busy = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(
+            busy,
+            0,
+            "round {round}: {busy} of 16 callers got Busy, but the group has 16 slots for 16 \
+             callers [{}]",
+            state(&pool, &["a", "b"])
+        );
+    }
 }
